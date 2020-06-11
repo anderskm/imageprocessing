@@ -30,7 +30,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 import os, glob, fnmatch
 import micasense.image as image
 import micasense.capture as capture
+from micasense.imageutils import save_capture as save_capture
 import multiprocessing
+
+import exiftool
+
 
 def image_from_file(filename):
     return image.Image(filename)
@@ -44,23 +48,27 @@ class ImageSet(object):
         captures.sort()
         
     @classmethod
-    def from_directory(cls, directory, progress_callback=None):
+    def from_directory(cls, directory, progress_callback=None, exiftool_path=None):
         """
         Create and ImageSet recursively from the files in a directory
         """
+        cls.basedir = directory
         matches = []
         for root, dirnames, filenames in os.walk(directory):
             for filename in fnmatch.filter(filenames, '*.tif'):
                 matches.append(os.path.join(root, filename))
 
-        pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
         images = []
-        for i,img in enumerate(pool.imap_unordered(image_from_file, matches)):
-            images.append(img)
-            if progress_callback is not None:
-                progress_callback(float(i)/float(len(matches)))
-        pool.close() 
-        pool.join()
+
+        if exiftool_path is None and os.environ.get('exiftoolpath') is not None:
+            exiftool_path = os.path.normpath(os.environ.get('exiftoolpath'))
+
+        with exiftool.ExifTool(exiftool_path) as exift:
+            for i,path in enumerate(matches):
+                images.append(image.Image(path, exiftool_obj=exift))
+                if progress_callback is not None:
+                    progress_callback(float(i)/float(len(matches)))
+
         # create a dictionary to index the images so we can sort them
         # into captures
         # {
@@ -86,6 +94,7 @@ class ImageSet(object):
         columns = [
             'timestamp',
             'latitude','longitude','altitude',
+            'capture_id',
             'dls-yaw','dls-pitch','dls-roll'
         ]
         irr = ["irr-{}".format(wve) for wve in self.captures[0].center_wavelengths()]
@@ -94,9 +103,10 @@ class ImageSet(object):
         for cap in self.captures:
             dat = cap.utc_time()
             loc = list(cap.location())
+            uuid = cap.uuid
             dls_pose = list(cap.dls_pose())
             irr = cap.dls_irradiance()
-            row = [dat]+loc+dls_pose+irr
+            row = [dat]+loc+[uuid]+dls_pose+irr
             data.append(row)
         return data, columns
 
@@ -106,4 +116,34 @@ class ImageSet(object):
             dat = cap.utc_time().isoformat()
             irr = cap.dls_irradiance()
             series[dat] = irr
+
+    def save_stacks(self, warp_matrices, stackDirectory, thumbnailDirectory=None, irradiance=None, multiprocess=True, overwrite=False, progress_callback=None):
+        
+        if not os.path.exists(stackDirectory):
+            os.makedirs(stackDirectory)
+        if thumbnailDirectory is not None and not os.path.exists(thumbnailDirectory):
+            os.makedirs(thumbnailDirectory)
+
+        save_params_list = []
+        for capture in self.captures:
+            save_params_list.append({
+                'output_path': stackDirectory,
+                'thumbnail_path': thumbnailDirectory,
+                'file_list': [img.path for img in capture.images],
+                'warp_matrices': warp_matrices,
+                'irradiance_list': irradiance,
+                'photometric': 'MINISBLACK',
+                'overwrite_existing': overwrite,
+            })
+
+        if multiprocess:
+            pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+            for i,_ in enumerate(pool.imap_unordered(save_capture, save_params_list)):
+                if progress_callback is not None:
+                    progress_callback(float(i)/float(len(save_params_list)))
+            pool.close()
+            pool.join()
+        else:
+            for params in save_params_list:
+                save_capture(params)
 

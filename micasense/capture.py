@@ -30,8 +30,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 import micasense.image as image
 import micasense.dls as dls
 import micasense.plotutils as plotutils
+import micasense.imageutils as imageutils
 import math
 import numpy as np
+import cv2
+import os
+import imageio
 
 class Capture(object):
     """
@@ -40,7 +44,7 @@ class Capture(object):
     found in the same folder and also share the same filename prefix, such
     as IMG_0000_*.tif, but this is not required
     """
-    def __init__(self, images,panelCorners=[None]*5):
+    def __init__(self, images, panelCorners=None):
         if isinstance(images, image.Image):
             self.images = [images]
         elif isinstance(images, list):
@@ -55,48 +59,55 @@ class Capture(object):
         self.uuid = self.images[0].capture_id
         self.panels = None
         self.detected_panel_count = 0
-        self.panelCorners = panelCorners
-        self.dls_orientation_vector = np.array([0,0,-1])
-        self.sun_vector_ned, \
-        self.sensor_vector_ned, \
-        self.sun_sensor_angle, \
-        self.solar_elevation, \
-        self.solar_azimuth=dls.compute_sun_angle(self.location(),
-                                           self.dls_pose(),
-                                           self.utc_time(),
-                                           self.dls_orientation_vector)
-        self.fresnel_correction = dls.fresnel(self.sun_sensor_angle)
-        
+        if panelCorners is None:
+            self.panelCorners = [None]*len(self.eo_indices())
+        else:
+            self.panelCorners = panelCorners
+
+        self.__aligned_capture = None
+
     def set_panelCorners(self,panelCorners):
         self.panelCorners = panelCorners
         self.panels = None
         self.detect_panels()
-        
+
     def append_image(self, image):
         if self.uuid != image.capture_id:
             raise RuntimeError("Added images must have the same capture id")
         self.images.append(image)
         self.images.sort()
-    
+
     def append_images(self, images):
         [self.append_image(img) for img in images]
-    
+
+    def append_file(self, file_name):
+        self.append_image(image.Image(file_name))
+
     @classmethod
     def from_file(cls, file_name):
         return cls(image.Image(file_name))
-        
+
     @classmethod
     def from_filelist(cls, file_list):
+        if len(file_list) == 0:
+            raise IOError("No files provided. Check your file paths")
+        for fle in file_list:
+            if not os.path.isfile(fle):
+                raise IOError("All files in file list must be a file. The following file is not:\nfle")
         images = [image.Image(fle) for fle in file_list]
         return cls(images)
 
-    def __plot(self, imgs, num_cols=3, plot_type=None, colorbar=True, figsize=(14, 14)):
+    def __get_reference_index(self):
+        # find the reference image which has the smallest rig offsets - they should be (0,0)
+        return np.argmin((np.array([i.rig_xy_offset_in_px() for i in self.images])**2).sum(1))
+
+    def __plot(self, imgs, num_cols=2, plot_type=None, colorbar=True, figsize=(14, 14)):
         ''' plot the radiance images for the capture '''
         if plot_type == None:
             plot_type = ''
         else:
             titles = [
-                '{} Band {} {}'.format(str(img.band_name), str(img.band_index), plot_type)
+                '{} Band {} {}'.format(str(img.band_name), str(img.band_index), plot_type if img.band_name.upper() != 'LWIR' else 'Brightness Temperature')
                 for img
                 in self.images
             ]
@@ -108,7 +119,7 @@ class Capture(object):
 
     def __lt__(self, other):
         return self.utc_time() < other.utc_time()
-    
+
     def __gt__(self, other):
         return self.utc_time() > other.utc_time()
 
@@ -117,8 +128,8 @@ class Capture(object):
 
     def location(self):
         ''' (lat, lon, alt) tuple of WGS-84 location units are radians, meters msl'''
-        return (self.images[0].latitude, self.images[0].longitude, self.images[0].altitude)
-    
+        return (self.images[0].location)
+
     def utc_time(self):
         ''' returns a timezone-aware datetime object of the capture time '''
         return self.images[0].utc_time
@@ -128,17 +139,22 @@ class Capture(object):
            data stored in this class.  Call this after processing-heavy image
            calls to manage program memory footprint.  When processing many images,
            such as iterating over the captures in an ImageSet, it may be necessary
-           to call this after capture is processed''' 
+           to call this after capture is processed'''
         for img in self.images:
             img.clear_image_data()
+        self.__aligned_capture = None
 
     def center_wavelengths(self):
         '''Returns a list of the image center wavelenghts in nanometers'''
         return [img.center_wavelength for img in self.images]
 
     def band_names(self):
-        '''Returns a list of the image band names'''
+        '''Returns a list of the image band names as they are in the image metadata'''
         return [img.band_name for img in self.images]
+    
+    def band_names_lower(self):
+        '''Returns a list of the image band names in all lower case for easier comparisons'''
+        return [img.band_name.lower() for img in self.images]
 
     def dls_present(self):
         '''Returns true if DLS metadata is present in the images'''
@@ -146,22 +162,18 @@ class Capture(object):
 
     def dls_irradiance_raw(self):
         '''Returns a list of the raw DLS measurements from the image metadata'''
-        return [img.dls_irradiance for img in self.images]
+        return [img.spectral_irradiance for img in self.images]
 
     def dls_irradiance(self):
-        '''Returns a list of the corrected DLS irradiance in W/m^2/nm'''
-        ground_irradiances = []
-        for img in self.images:
-            dir_dif_ratio = 6.0
-            percent_diffuse = 1.0/dir_dif_ratio
-            #percent_diffuse = 5e4/(img.center_wavelength**2)
-            sensor_irradiance = img.dls_irradiance / self.fresnel_correction
-            # find direct irradiance in the plane normal to the sun
-            untilted_direct_irr = sensor_irradiance / (percent_diffuse + np.cos(self.sun_sensor_angle))
-            # compute irradiance on the ground using the solar altitude angle
-            ground_irr = untilted_direct_irr * (percent_diffuse + np.sin(self.solar_elevation))
-            ground_irradiances.append(ground_irr)
-        return ground_irradiances
+        '''Returns a list of the corrected earth-surface (horizontal) DLS irradiance in W/m^2/nm'''
+        return [img.horizontal_irradiance for img in self.images]
+
+    def direct_irradiance(self):
+        '''Returns a list of the DLS irradiance from the direct source in W/m^2/nm'''
+        return [img.direct_irradiance for img in self.images]
+    def scattered_irradiance(self):
+        '''Returns a list of the DLS irradiance from the direct source in W/m^2/nm'''
+        return [img.scattered_irradiance for img in self.images]
 
     def dls_pose(self):
         '''Returns (yaw,pitch,roll) tuples in radians of the earth-fixed dls pose'''
@@ -169,47 +181,83 @@ class Capture(object):
 
     def plot_raw(self):
         '''Plot raw images as the data came from the camera'''
-        self.__plot([img.raw() for img in self.images], 
-                    figsize=(12, 6),
+        self.__plot([img.raw() for img in self.images],
                     plot_type='Raw')
 
     def plot_vignette(self):
         '''Compute (if necessary) and plot vignette correction images'''
-        self.__plot([img.vignette()[0].T for img in self.images], 
-                    figsize=(12, 6),
+        self.__plot([img.vignette()[0].T for img in self.images],
                     plot_type='Vignette')
 
     def plot_radiance(self):
         '''Compute (if necessary) and plot radiance images'''
-        self.__plot([img.radiance() for img in self.images], 
-                    figsize=(12, 6),
+        self.__plot([img.radiance() for img in self.images],
                     plot_type='Radiance')
 
     def plot_undistorted_radiance(self):
         '''Compute (if necessary) and plot undistorted radiance images'''
         self.__plot(
-            [img.undistorted(img.radiance()) for img in self.images],
-            figsize=(12, 6),
-            plot_type='Undistored Radiance')
-    
+                    [img.undistorted(img.radiance()) for img in self.images],
+                    plot_type='Undistored Radiance')
+
     def plot_undistorted_reflectance(self, irradiance_list):
         '''Compute (if necessary) and plot reflectances given a list of irrdiances'''
         self.__plot(
-            self.reflectance(irradiance_list),
-            figsize=(12, 6),
-            plot_type='Undistored Reflectance')
+                    self.undistorted_reflectance(irradiance_list),
+                    plot_type='Undistorted Reflectance')
 
-    def compute_reflectance(self, irradiance_list):
+    def compute_radiance(self):
+        [img.radiance() for img in self.images]
+
+    def compute_undistorted_radiance(self):
+        [img.undistorted_radiance() for img in self.images]
+
+    def compute_reflectance(self, irradiance_list=None, force_recompute=True):
         '''Compute image reflectance from irradiance list, but don't return'''
-        [img.reflectance(irradiance_list[i]) for i,img in enumerate(self.images)]
-    
+        if irradiance_list is not None:
+            [img.reflectance(irradiance_list[i], force_recompute=force_recompute) for i,img in enumerate(self.images)]
+        else:
+            [img.reflectance(force_recompute=force_recompute) for img in self.images]
+
+    def compute_undistorted_reflectance(self, irradiance_list=None, force_recompute=True):
+        '''Compute image reflectance from irradiance list, but don't return'''
+        if irradiance_list is not None:
+            [img.undistorted_reflectance(irradiance_list[i], force_recompute=force_recompute) for i,img in enumerate(self.images)]
+        else:
+            [img.undistorted_reflectance(force_recompute=force_recompute) for img in self.images]
+
+
+    def eo_images(self):
+        return [img for img in self.images if img.band_name != 'LWIR']
+
+    def lw_images(self):
+        return [img for img in self.images if img.band_name == 'LWIR']
+
+    def eo_indices(self):
+        return [index for index,img in enumerate(self.images) if img.band_name != 'LWIR']
+
+    def lw_indices(self):
+        return [index for index,img in enumerate(self.images) if img.band_name == 'LWIR']
+
     def reflectance(self, irradiance_list):
         '''Comptute and return list of reflectance images for given irradiance'''
-        return [img.reflectance(irradiance_list[i]) for i,img in enumerate(self.images)]
+        eo_imgs = [img.reflectance(irradiance_list[i]) for i,img in enumerate(self.eo_images())]
+        lw_imgs = [img.reflectance() for i,img in enumerate(self.lw_images())]
+        return eo_imgs + lw_imgs
+
+    def undistorted_reflectance(self, irradiance_list):
+        '''Comptute and return list of reflectance images for given irradiance'''
+        eo_imgs = [img.undistorted(img.reflectance(irradiance_list[i])) for i,img in enumerate(self.eo_images())]
+        lw_imgs = [img.undistorted(img.reflectance()) for i,img in enumerate(self.lw_images())]
+        return eo_imgs + lw_imgs
+
+    def panels_in_all_expected_images(self):
+        expected_panels = sum(str(img.band_name).upper() != 'LWIR' for img in self.images)
+        return self.detect_panels() == expected_panels
 
     def panel_raw(self):
         if self.panels is None:
-            if self.detect_panels() != len(self.images):
+            if not self.panels_in_all_expected_images():
                 raise IOError("Panels not detected in all images")
         raw_list = []
         for p in self.panels:
@@ -219,20 +267,22 @@ class Capture(object):
 
     def panel_radiance(self):
         if self.panels is None:
-            if self.detect_panels() != len(self.images):
+            if not self.panels_in_all_expected_images():
                 raise IOError("Panels not detected in all images")
         radiance_list = []
         for p in self.panels:
             mean, _, _, _ = p.radiance()
             radiance_list.append(mean)
         return radiance_list
-    
-    def panel_irradiance(self, reflectances):
+
+    def panel_irradiance(self, reflectances=None):
         if self.panels is None:
-            if self.detect_panels() != len(self.images):
+            if not self.panels_in_all_expected_images():
                 raise IOError("Panels not detected in all images")
+        if reflectances == None:
+            reflectances = [panel.reflectance_from_panel_serial() for panel in self.panels]
         if len(reflectances) != len(self.panels):
-            raise ValueError("Length of panel reflecances must match lengh of images")
+            raise ValueError("Length of panel reflectances must match lengh of images")
         irradiance_list = []
         for i,p in enumerate(self.panels):
             mean_irr = p.irradiance_mean(reflectances[i])
@@ -241,7 +291,7 @@ class Capture(object):
 
     def panel_reflectance(self, panel_refl_by_band=None):
         if self.panels is None:
-            if self.detect_panels() != len(self.images):
+            if not self.panels_in_all_expected_images():
                 raise IOError("Panels not detected in all images")
         reflectance_list = []
         for i,p in enumerate(self.panels):
@@ -249,6 +299,15 @@ class Capture(object):
             mean_refl = p.reflectance_mean()
             reflectance_list.append(mean_refl)
         return reflectance_list
+
+    def panel_albedo(self):
+        if self.panels_in_all_expected_images():
+            albedos = [panel.reflectance_from_panel_serial() for panel in self.panels]
+            if None in albedos:
+                albedos = None
+        else:
+            albedos = None
+        return albedos
 
     def detect_panels(self):
         from micasense.panel import Panel
@@ -260,18 +319,171 @@ class Capture(object):
             if p.panel_detected():
                 self.detected_panel_count += 1
         # is panelCorners are defined by hand
-        if self.panelCorners is not None:
-           self.detected_panel_count = len(self.panelCorners) 
-        return self.detected_panel_count               
+        if self.panelCorners is not None and all(corner is not None for corner in self.panelCorners):
+           self.detected_panel_count = len(self.panelCorners)
+        return self.detected_panel_count
 
     def plot_panels(self):
         if self.panels is None:
-            if self.detect_panels() != len(self.images):
+            if not self.panels_in_all_expected_images():
                 raise IOError("Panels not detected in all images")
         self.__plot(
             [p.plot_image() for p in self.panels],
             plot_type='Panels',
-            num_cols=2,
-            figsize=(14, 14),
             colorbar=False
         )
+
+    def set_external_rig_relatives(self,external_rig_relatives):
+        for i,img in enumerate(self.images):
+            img.set_external_rig_relatives(external_rig_relatives[str(i)])
+
+    def has_rig_relatives(self):
+        for img in self.images:
+            if img.meta.rig_relatives() is None:
+                return False
+        return True
+
+    def get_warp_matrices(self, ref_index=None):
+        if ref_index is None:
+            ref = self.images[self.__get_reference_index()]
+        else:
+            ref = self.images[ref_index]
+        warp_matrices  =[np.linalg.inv(im.get_homography(ref)) for im in self.images]
+        return [w/w[2,2] for w in warp_matrices]
+
+    def create_aligned_capture(self, irradiance_list=None, warp_matrices=None, normalize=False, img_type=None, motion_type=cv2.MOTION_HOMOGRAPHY):
+        if img_type is None and irradiance_list is None and self.dls_irradiance() is None:
+            self.compute_undistorted_radiance()
+            img_type = 'radiance'
+        elif img_type is None:
+            if irradiance_list is None:
+                irradiance_list = self.dls_irradiance()+[0]
+            self.compute_undistorted_reflectance(irradiance_list)
+            img_type = 'reflectance'
+        if warp_matrices is None:
+            warp_matrices = self.get_warp_matrices()
+        cropped_dimensions,_ = imageutils.find_crop_bounds(self,warp_matrices,warp_mode=motion_type)
+        self.__aligned_capture = imageutils.aligned_capture(self,
+                                                warp_matrices,
+                                                motion_type,
+                                                cropped_dimensions,
+                                                None,
+                                                img_type=img_type)
+        return self.__aligned_capture
+
+    def aligned_shape(self):
+        if self.__aligned_capture is None:
+            raise RuntimeError("call Capture.create_aligned_capture prior to saving as stack")
+        return self.__aligned_capture.shape
+
+    def save_capture_as_stack(self, outfilename, sort_by_wavelength=False,photometric='MINISBLACK'):
+        from osgeo.gdal import GetDriverByName, GDT_UInt16
+        if self.__aligned_capture is None:
+            raise RuntimeError("call Capture.create_aligned_capture prior to saving as stack")
+
+        rows, cols, bands = self.__aligned_capture.shape
+        driver = GetDriverByName('GTiff')
+        
+        outRaster = driver.Create(outfilename, cols, rows, bands, GDT_UInt16, options = [ 'INTERLEAVE=BAND','COMPRESS=DEFLATE',f'PHOTOMETRIC={photometric}' ])
+        try:
+            if outRaster is None:
+                raise IOError("could not load gdal GeoTiff driver")
+
+            if sort_by_wavelength:
+                eo_list = list(np.argsort(np.array(self.center_wavelengths())[self.eo_indices()]))
+            else:
+                eo_list = self.eo_indices()
+
+            for outband,inband in enumerate(eo_list):
+                outband = outRaster.GetRasterBand(outband+1)
+                outdata = self.__aligned_capture[:,:,inband]
+                outdata[outdata<0] = 0
+                outdata[outdata>2] = 2   #limit reflectance data to 200% to allow some specular reflections
+                outband.WriteArray(outdata*32768) # scale reflectance images so 100% = 32768
+                outband.FlushCache()
+
+            for outband,inband in enumerate(self.lw_indices()):
+                outband = outRaster.GetRasterBand(len(eo_list)+outband+1)
+                outdata = (self.__aligned_capture[:,:,inband]+273.15) * 100 # scale data from float degC to back to centi-Kelvin to fit into uint16
+                outdata[outdata<0] = 0
+                outdata[outdata>65535] = 65535
+                outband.WriteArray(outdata)
+                outband.FlushCache()
+        finally:
+            outRaster = None
+
+    def save_capture_as_rgb(self, outfilename, gamma=1.4, downsample=1, white_balance='norm', hist_min_percent=0.5, hist_max_percent=99.5, sharpen=True, rgb_band_indices = [2,1,0]):
+        if self.__aligned_capture is None:
+            raise RuntimeError("call Capture.create_aligned_capture prior to saving as RGB")
+        im_display = np.zeros((self.__aligned_capture.shape[0],self.__aligned_capture.shape[1],self.__aligned_capture.shape[2]), dtype=np.float32 )
+
+        im_min = np.percentile(self.__aligned_capture[:,:,rgb_band_indices].flatten(), hist_min_percent)  # modify these percentiles to adjust contrast
+        im_max = np.percentile(self.__aligned_capture[:,:,rgb_band_indices].flatten(), hist_max_percent)  # for many images, 0.5 and 99.5 are good values
+
+        for i in rgb_band_indices:
+            # for rgb true color, we usually want to use the same min and max scaling across the 3 bands to
+            # maintain the "white balance" of the calibrated image
+            if white_balance == 'norm':
+                im_display[:,:,i] =  imageutils.normalize(self.__aligned_capture[:,:,i], im_min, im_max)
+            else:
+                im_display[:,:,i] =  imageutils.normalize(self.__aligned_capture[:,:,i])
+
+        rgb = im_display[:,:,rgb_band_indices]
+        rgb = cv2.resize(rgb, None, fx=1/downsample, fy=1/downsample, interpolation=cv2.INTER_AREA)
+
+        if sharpen:
+            gaussian_rgb = cv2.GaussianBlur(rgb, (9,9), 10.0)
+            gaussian_rgb[gaussian_rgb<0] = 0
+            gaussian_rgb[gaussian_rgb>1] = 1
+            unsharp_rgb = cv2.addWeighted(rgb, 1.5, gaussian_rgb, -0.5, 0)
+            unsharp_rgb[unsharp_rgb<0] = 0
+            unsharp_rgb[unsharp_rgb>1] = 1
+        else:
+            unsharp_rgb = rgb
+
+        # Apply a gamma correction to make the render appear closer to what our eyes would see
+        if gamma != 0:
+            gamma_corr_rgb = unsharp_rgb**(1.0/gamma)
+            imageio.imwrite(outfilename, (255*gamma_corr_rgb).astype('uint8'))
+        else:
+            imageio.imwrite(outfilename, (255*unsharp_rgb).astype('uint8'))
+    
+    def save_thermal_over_rgb(self, outfilename, figsize=(30,23), lw_index = None, hist_min_percent = 0.2, hist_max_percent = 99.8):
+        if self.__aligned_capture is None:
+            raise RuntimeError("call Capture.create_aligned_capture prior to saving as RGB")
+
+        # by default we don't mask the thermal, since it's native resolution is much lower than the MS
+        if lw_index is None:
+            lw_index = self.lw_indices()[0]
+        masked_thermal = self.__aligned_capture[:,:,lw_index]
+        
+        im_display = np.zeros((self.__aligned_capture.shape[0],self.__aligned_capture.shape[1],3), dtype=np.float32 )
+        rgb_band_indices = [self.band_names_lower().index('red'),
+                            self.band_names_lower().index('green'),
+                            self.band_names_lower().index('blue')]
+
+        # for rgb true color, we usually want to use the same min and max scaling across the 3 bands to 
+        # maintain the "white balance" of the calibrated image  
+        im_min = np.percentile(self.__aligned_capture[:,:,rgb_band_indices].flatten(), hist_min_percent)  # modify these percentiles to adjust contrast
+        im_max = np.percentile(self.__aligned_capture[:,:,rgb_band_indices].flatten(), hist_max_percent)  # for many images, 0.5 and 99.5 are good values
+        for dst_band,src_band in enumerate(rgb_band_indices):
+            im_display[:,:,dst_band] =  imageutils.normalize(self.__aligned_capture[:,:,src_band], im_min, im_max)
+
+        # Compute a histogram
+        min_display_therm = np.percentile(masked_thermal, hist_min_percent)
+        max_display_therm = np.percentile(masked_thermal, hist_max_percent)
+
+        fig, _ = plotutils.plot_overlay_withcolorbar(im_display,
+                                            masked_thermal, 
+                                            figsize=figsize, 
+                                            title='Temperature over True Color',
+                                            vmin=min_display_therm,vmax=max_display_therm,
+                                            overlay_alpha=0.25,
+                                            overlay_colormap='jet',
+                                            overlay_steps=16,
+                                            display_contours=True,
+                                            contour_steps=16,
+                                            contour_alpha=.4,
+                                            contour_fmt="%.0fC",
+                                            show=False)
+        fig.savefig(outfilename)
